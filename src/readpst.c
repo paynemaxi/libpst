@@ -8,6 +8,7 @@
 #include "define.h"
 #include "lzfu.h"
 #include "msg.h"
+#include <stdarg.h>
 
 #define OUTPUT_TEMPLATE "%s.%s"
 #define OUTPUT_KMAIL_DIR_TEMPLATE ".%s.directory"
@@ -148,6 +149,111 @@ int         check_password = 0; // -p
 char*       check_password_value = NULL;
 int         has_password = 0;   // -P
 
+#define NID_TYPE_MASK           0x1f
+#define NID_TYPE_NORMAL_FOLDER  0x02
+#define NID_TYPE_NORMAL_MESSAGE 0x04
+
+static int         json_progress = 0;
+static uint64_t    total_emails = 0, imported_emails = 0, failed_emails = 0;
+static uint64_t    unknown_items = 0, processed_attachments = 0;
+static const char *message_error = NULL;
+static time_t      import_started;
+static int         import_complete = 0;
+static int         total_complete = 0;
+
+static void write_json_string(const char *text)
+{
+    const unsigned char *p = (const unsigned char *)(text ? text : "");
+    putchar('"');
+    for (; *p; p++) {
+        if (*p == '"' || *p == '\\') printf("\\%c", *p);
+        else if (*p < 32) printf("\\u%04x", *p);
+        else putchar(*p);
+    }
+    putchar('"');
+}
+
+static void report_progress(const char *event, const char *folder, pst_item *item,
+                            uint64_t id, const char *error)
+{
+    if (!json_progress) return;
+    printf("{\"event\":");
+    write_json_string(event);
+    
+    printf(",\"total\":%" PRIu64 ",\"imported\":%" PRIu64
+           ",\"failed\":%" PRIu64 ",\"unknown\":%" PRIu64
+           ",\"attachments\":%" PRIu64 ",\"elapsed_seconds\":%ld,",
+           total_emails, imported_emails, failed_emails, unknown_items,
+           processed_attachments, (long)(time(NULL) - import_started));
+    printf("\"total_complete\":%s,\"folder\":", total_complete ? "true" : "false");
+    write_json_string(folder);
+    
+    printf(",\"subject\":");
+    
+    if (item) pst_convert_utf8_null(item, &item->subject);
+    write_json_string(item ? item->subject.str : NULL);
+    
+    printf(",\"id\":%" PRIu64 ",\"error\":", id);
+    write_json_string(error);
+    
+    puts("}");
+
+    fflush(stdout);
+}
+
+static int is_email(const pst_item *item)
+{
+    return item->email && (item->type == PST_TYPE_NOTE ||
+           item->type == PST_TYPE_SCHEDULE || item->type == PST_TYPE_REPORT);
+}
+
+static void count_emails(pst_desc_tree *node)
+{
+    for (; node; node = node->next) {
+        unsigned type = node->d_id & NID_TYPE_MASK;
+        
+        if (type != NID_TYPE_NORMAL_FOLDER && type != NID_TYPE_NORMAL_MESSAGE) continue;
+        pst_item *item = node->desc ? pst_parse_item(&pstfile, node, NULL) : NULL;
+        
+        if (!item) {
+            if (type == NID_TYPE_NORMAL_MESSAGE) total_emails++;
+            else total_complete = 0;
+
+            continue;
+        }
+
+        if (item->folder && item->file_as.str) {
+            if (deleted_mode == DMODE_INCLUDE || strcasecmp(item->file_as.str, "Deleted Items"))
+                count_emails(node->child);
+        }
+        else if (is_email(item)) {
+            total_emails++;
+        }
+
+        pst_freeItem(item);
+    }
+}
+
+static void report_aborted_import(void)
+{
+    if (!import_complete) report_progress("fatal", NULL, NULL, 0, "import_aborted");
+}
+
+static void print_error(const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    vfprintf(stderr, format, args);
+    va_end(args);
+}
+
+#undef DIE
+#define DIE(x) { \
+    if (json_progress) print_error x; else WARN(x); \
+    DEBUG_CLOSE(); \
+    exit(EXIT_FAILURE); \
+}
+
 #ifdef HAVE_SEMAPHORE_H
 int         shared_memory_id;
 sem_t*      global_children = NULL;
@@ -247,11 +353,21 @@ void process(pst_item *outeritem, pst_desc_tree *d_ptr)
 
     DEBUG_ENT("process");
     create_enter_dir(&ff, outeritem);
+    report_progress("folder", ff.dname, NULL, 0, NULL);
 
     for (; d_ptr; d_ptr = d_ptr->next) {
+        unsigned type = d_ptr->d_id & NID_TYPE_MASK;
+        if (json_progress && type != NID_TYPE_NORMAL_FOLDER && type != NID_TYPE_NORMAL_MESSAGE)
+            continue;
         DEBUG_INFO(("New item record\n"));
         if (!d_ptr->desc) {
             ff.skip_count++;
+            if (json_progress) {
+                unknown_items++;
+                if (type == NID_TYPE_NORMAL_MESSAGE) failed_emails++;
+            }
+
+            report_progress("error", ff.dname, NULL, d_ptr->d_id, "missing_descriptor");
             DEBUG_WARN(("ERROR item's desc record is NULL\n"));
             continue;
         }
@@ -262,6 +378,12 @@ void process(pst_item *outeritem, pst_desc_tree *d_ptr)
 
         if (!item) {
             ff.skip_count++;
+            if (json_progress) {
+                unknown_items++;
+                if (type == NID_TYPE_NORMAL_MESSAGE) failed_emails++;
+            }
+
+            report_progress("error", ff.dname, NULL, d_ptr->d_id, "item_unreadable");
             DEBUG_INFO(("A NULL item was seen\n"));
             continue;
         }
@@ -323,7 +445,7 @@ void process(pst_item *outeritem, pst_desc_tree *d_ptr)
                 if (mode == MODE_SEPARATE) close_separate_file(&ff);
             }
 
-        } else if (item->email && ((item->type == PST_TYPE_NOTE) || (item->type == PST_TYPE_SCHEDULE) || (item->type == PST_TYPE_REPORT))) {
+        } else if (is_email(item)) {
             DEBUG_INFO(("Processing Email\n"));
             if (!(output_type_mode & OTMODE_EMAIL)) {
                 ff.skip_count++;
@@ -331,6 +453,7 @@ void process(pst_item *outeritem, pst_desc_tree *d_ptr)
             }
             else {
                 char *extra_mime_headers = NULL;
+                message_error = NULL;
                 ff.item_count++;
                 if (mode == MODE_SEPARATE) {
                     // process this single email message, possibly forking
@@ -362,7 +485,26 @@ void process(pst_item *outeritem, pst_desc_tree *d_ptr)
                 }
                 else {
                     // process this single email message, cannot fork since not separate mode
-                    write_normal_email(ff.output[PST_TYPE_NOTE], ff.name[PST_TYPE_NOTE], item, mode, mode_MH, &pstfile, save_rtf_body, 0, &extra_mime_headers);
+                    FILE *output = ff.output[PST_TYPE_NOTE];
+                    off_t message_start = json_progress ? ftello(output) : 0;
+                    uint64_t attachments_before = processed_attachments;
+                    write_normal_email(output, ff.name[PST_TYPE_NOTE], item, mode, mode_MH, &pstfile, save_rtf_body, 0, &extra_mime_headers);
+                    
+                    if (json_progress) {
+                        if (fflush(output) || ferror(output))
+                            DIE(("Cannot write mailbox %s\n", ff.name[PST_TYPE_NOTE]));
+                        if (message_error) {
+                            if (message_start < 0 || ftruncate(fileno(output), message_start) ||
+                                fseeko(output, message_start, SEEK_SET))
+                                DIE(("Cannot discard incomplete message\n"));
+                            processed_attachments = attachments_before;
+                            failed_emails++;
+                        }
+                        else imported_emails++;
+                        
+                        report_progress(message_error ? "error" : "progress", ff.dname,
+                                       item, d_ptr->d_id, message_error);
+                    }
                 }
             }
 
@@ -427,7 +569,7 @@ int main(int argc, char* const* argv) {
     }
 
     // command-line option handling
-    while ((c = getopt(argc, argv, "a:bC:c:Dd:emhj:kMo:p:PqrSt:uVwL:8"))!= -1) {
+    while ((c = getopt(argc, argv, "a:bC:c:Dd:emhJj:kMo:p:PqrSt:uVwL:8"))!= -1) {
         switch (c) {
         case 'a':
             if (optarg) {
@@ -477,6 +619,9 @@ int main(int argc, char* const* argv) {
         case 'h':
             usage();
             exit(0);
+            break;
+        case 'J':
+            json_progress = 1;
             break;
         case 'j':
             max_children = atoi(optarg);
@@ -594,6 +739,23 @@ int main(int argc, char* const* argv) {
         exit(2);
     }
 
+    if (json_progress) {
+        if (mode != MODE_NORMAL || has_password || check_password) {
+            fprintf(stderr, "-J requires normal mbox mode without -p or -P\n");
+            return 1;
+        }
+
+        output_mode = OUTPUT_QUIET;
+        output_type_mode = OTMODE_EMAIL;
+        
+        max_child_specified = 1;
+        max_children = 0;
+        
+        import_started = time(NULL);
+        atexit(report_aborted_import);
+        report_progress("counting", NULL, NULL, 0, NULL);
+    }
+
 #ifdef _SC_NPROCESSORS_ONLN
     number_processors =  sysconf(_SC_NPROCESSORS_ONLN);
 #endif
@@ -707,6 +869,11 @@ int main(int argc, char* const* argv) {
         DIE(("Top of folders record not found. Cannot continue\n"));
     }
 
+    if (json_progress) {
+        total_complete = 1;
+        count_emails(d_ptr->child);
+        report_progress("start", NULL, NULL, 0, NULL);
+    }
     process(item, d_ptr->child);    // do the children of TOPF
     grim_reaper(1); // wait for all child processes
 
@@ -714,6 +881,8 @@ int main(int argc, char* const* argv) {
     pst_close(&pstfile);
     DEBUG_RET();
     DEBUG_CLOSE();
+    import_complete = 1;
+    report_progress("complete", NULL, NULL, 0, NULL);
 
 #ifdef HAVE_SEMAPHORE_H
     if (global_children) {
@@ -801,6 +970,7 @@ void usage() {
     printf("\t-d <filename> \t- Debug to file.\n");
     printf("\t-e\t- As with -M, but include extensions on output files\n");
     printf("\t-h\t- Help. This screen\n");
+    printf("\t-J\t- JSON progress for email-only\n");
     printf("\t-j <integer>\t- Number of parallel jobs to run\n");
     printf("\t-k\t- KMail. Output in kmail format\n");
     printf("\t-m\t- As with -e, but write .msg files also\n");
@@ -1209,14 +1379,17 @@ void write_embedded_message(FILE* f_output, pst_item_attach* attach, char *bound
     // a reference to an internal Outlook COM class.
     //      Log the skipped item and continue on.
     if (!item) {
+        if (json_progress) message_error = "attachment_unreadable";
         DEBUG_WARN(("write_embedded_message: pst_parse_item was unable to parse the embedded message in attachment ID %" PRIu64, attach->i_id));
     } else {
         if (!item->email) {
+            if (json_progress) message_error = "attachment_unreadable";
             DEBUG_WARN(("write_embedded_message: pst_parse_item returned type %d, not an email message", item->type));
         } else {
             fprintf(f_output, "\n--%s\n", boundary);
             fprintf(f_output, "Content-Type: %s\n\n", attach->mimetype.str);
             write_normal_email(f_output, "", item, MODE_NORMAL, 0, pf, save_rtf, 1, extra_mime_headers);
+            if (json_progress) processed_attachments++;
         }
         pst_freeItem(item);
     }
@@ -1328,6 +1501,7 @@ void write_inline_attachment(FILE* f_output, pst_item_attach* attach, char *boun
         // make sure we can fetch data from the id
         pst_index_ll *ptr = pst_getID(pst, attach->i_id);
         if (!ptr) {
+            if (json_progress) message_error = "attachment_unreadable";
             DEBUG_WARN(("Couldn't find ID pointer. Cannot save attachment to file\n"));
             DEBUG_RET();
             return;
@@ -1369,7 +1543,15 @@ void write_inline_attachment(FILE* f_output, pst_item_attach* attach, char *boun
         fprintf(f_output, "Content-Disposition: inline\n\n");
     }
 
-    (void)pst_attach_to_file_base64(pst, attach, f_output);
+    size_t size = pst_attach_to_file_base64(pst, attach, f_output);
+    if (json_progress) {
+        if (!size && (attach->i_id || attach->data.size)) {
+            message_error = "attachment_unreadable";
+        }
+        else {
+            processed_attachments++;
+        }
+    }
     fprintf(f_output, "\n\n");
     DEBUG_RET();
 }
@@ -2037,6 +2219,9 @@ void write_normal_email(FILE* f_output, char f_name[], pst_item* item, int curre
         write_schedule_part(f_output, item, sender, boundary);
     }
 
+    if (json_progress && (item->flags & PST_FLAG_HAS_ATTACHMENT) && !item->attach)
+        message_error = "attachment_unreadable";
+
     // other attachments
     {
         pst_item_attach* attach;
@@ -2065,6 +2250,8 @@ void write_normal_email(FILE* f_output, char f_name[], pst_item* item, int curre
                         write_inline_attachment(f_output, attach, boundary, pst);
                 }
             }
+            else if (json_progress && (attach->method || attach->filename1.str || attach->filename2.str))
+                message_error = "attachment_unreadable";
         }
     }
 
@@ -2532,7 +2719,8 @@ void close_enter_dir(struct file_ll *f)
     for (t=0; t<PST_TYPE_MAX; t++) {
         if (f->output[t]) {
             if (mode == MODE_SEPARATE) DEBUG_WARN(("close_enter_dir finds open separate file\n"));
-            fclose(f->output[t]);
+            int result = fclose(f->output[t]);
+            if (json_progress && result) DIE(("Cannot close mailbox %s\n", f->name[t]));
             f->output[t] = NULL;
         }
         if (f->name[t]) {

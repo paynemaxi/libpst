@@ -12,3 +12,32 @@ Starting with a Git working directory, try this:
     make -C xml all distclean
     make distcheck
 
+
+readpst JSON progress
+--------------------
+    readpst -J -D -o OUTPUT FILE.pst
+
+-J exports email to mbox and writes one JSON event per stdout line.
+It counts messages first, then exports them without parallel jobs.
+-D includes Deleted Items; -o sets the output directory.
+-J cannot be used with other output modes, -p or -P.
+
+Examples from a PST with 10 messages, one unreadable:
+
+{"event":"progress","total":10,"imported":1,"failed":0,"unknown":0,"attachments":0,"elapsed_seconds":0,"total_complete":true,"folder":"Inbox","subject":"PST import test 01","id":2097188,"error":""}
+{"event":"error","total":10,"imported":4,"failed":1,"unknown":1,"attachments":0,"elapsed_seconds":0,"total_complete":true,"folder":"Inbox","subject":"","id":2097316,"error":"item_unreadable"}
+{"event":"complete","total":10,"imported":9,"failed":1,"unknown":1,"attachments":0,"elapsed_seconds":0,"total_complete":true,"folder":"","subject":"","id":0,"error":""}
+
+Events: counting, start, folder, progress, error, complete, fatal.
+
+Counters are cumulative. unknown counts unreadable elements, including
+folders; do not add it to failed. total includes unreadable message nodes.
+
+total_complete is false until counting finishes or if a folder cannot be read.
+id is the PST node ID; an unavailable subject is empty.
+
+attachments counts exported attachments, including inline and generated body
+attachments. A message with an unreadable attachment is discarded.
+
+Errors: missing_descriptor, item_unreadable, attachment_unreadable,
+import_aborted. Diagnostics go to stderr.
