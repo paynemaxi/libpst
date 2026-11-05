@@ -24,6 +24,7 @@ struct file_ll {
     int32_t stored_count;
     int32_t item_count;
     int32_t skip_count;
+    int32_t folder_type;
 };
 
 pid_t     try_fork(char* folder);
@@ -131,6 +132,7 @@ int         deleted_mode = DMODE_EXCLUDE;
 int         output_type_mode = 0xff;    // Default to all.
 int         contact_mode_specified = 0;
 int         overwrite = 0;
+int         keep_empty_folders = 0;
 int         prefer_utf8 = 0;
 int         save_rtf_body = 1;
 int         file_name_len = 10;     // enough room for MODE_SPEARATE file name
@@ -401,8 +403,8 @@ void process(pst_item *outeritem, pst_desc_tree *d_ptr)
                 pst_debug_unlock();
             }
             ff.item_count++;
-            if (d_ptr->child && (deleted_mode == DMODE_INCLUDE || strcasecmp(item->file_as.str, "Deleted Items"))) {
-                //if this is a non-empty folder other than deleted items, we want to recurse into it
+            if ((d_ptr->child || keep_empty_folders) && (deleted_mode == DMODE_INCLUDE || strcasecmp(item->file_as.str, "Deleted Items"))) {
+                //if this is a folder other than deleted items, we want to recurse into it
                 pid_t parent = getpid();
                 pid_t child = try_fork(item->file_as.str);
                 if (child == 0) {
@@ -569,7 +571,7 @@ int main(int argc, char* const* argv) {
     }
 
     // command-line option handling
-    while ((c = getopt(argc, argv, "a:bC:c:Dd:emhJj:kMo:p:PqrSt:uVwL:8"))!= -1) {
+    while ((c = getopt(argc, argv, "a:bC:c:Dd:EemhJj:kMo:p:PqrSt:uVwL:8"))!= -1) {
         switch (c) {
         case 'a':
             if (optarg) {
@@ -612,6 +614,9 @@ int main(int argc, char* const* argv) {
             break;
         case 'D':
             deleted_mode = DMODE_INCLUDE;
+            break;
+        case 'E':
+            keep_empty_folders = 1;
             break;
         case 'd':
             d_log = optarg;
@@ -961,6 +966,7 @@ void usage() {
     printf("\t-V\t- Version. Display program version\n");
     printf("\t-C charset\t- character set for items with an unspecified character set\n");
     printf("\t-D\t- Include deleted items in output\n");
+    printf("\t-E\t- Keep empty mail folders in output\n");
     printf("\t-L <level> \t- Set debug level; 1=debug,2=info,3=warn.\n");
     printf("\t-M\t- Write emails in the MH (rfc822) format\n");
     printf("\t-S\t- Separate. Write emails in the separate format\n");
@@ -2613,6 +2619,7 @@ void write_appointment(FILE* f_output, pst_item* item)
 void create_enter_dir(struct file_ll* f, pst_item *item)
 {
     memset(f, 0, sizeof(*f));
+    f->folder_type = item->type;
     f->stored_count = (item->folder) ? item->folder->item_count : 0;
     pst_convert_utf8(item, &item->file_as);
     f->dname = (char*) pst_malloc(strlen(item->file_as.str)+1);
@@ -2726,7 +2733,7 @@ void close_enter_dir(struct file_ll *f)
         if (f->name[t]) {
             struct stat st;
             stat(f->name[t], &st);
-            if (!st.st_size) {
+            if (!st.st_size && !(keep_empty_folders && f->folder_type == PST_TYPE_NOTE && t == PST_TYPE_NOTE)) {
                 DEBUG_WARN(("removing empty output file %s\n", f->name[t]));
                 remove(f->name[t]);
             }
