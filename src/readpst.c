@@ -745,8 +745,8 @@ int main(int argc, char* const* argv) {
     }
 
     if (json_progress) {
-        if (mode != MODE_NORMAL || has_password || check_password) {
-            fprintf(stderr, "-J requires normal mbox mode without -p or -P\n");
+        if ((mode != MODE_NORMAL && mode != MODE_RECURSE) || has_password || check_password) {
+            fprintf(stderr, "-J requires normal or recursive mbox mode without -p or -P\n");
             return 1;
         }
 
